@@ -99,6 +99,18 @@ jobs:
       - name: Apply iSH-ARM64 fixes for re-signed builds
         run: |
           python3 integration/apply_patches.py --ish-src ish
+          # The `Download Root` phase runs `curl https://$ROOTFS_URL`. Passing
+          # ROOTFS_URL=... on the xcodebuild command line does NOT win over the
+          # .xcconfig value (observed: it still fetched the upstream host and
+          # died on a TLS handshake), so rewrite the source of truth instead.
+          # Upstream's own default is also dead: github.com/ish-app/roots
+          # predates GitHub dropping TLS 1.0/1.1, and the build phase uses the
+          # ancient LibreSSL curl.
+          F="$(git -C ish ls-files '*GuestARM64.xcconfig' | head -n1)"
+          [ -n "$F" ] || { echo "::error::GuestARM64.xcconfig not found"; exit 1; }
+          echo "rewriting ROOTFS_URL in ish/$F"
+          sed -i '' -E 's#^ROOTFS_URL = .*#ROOTFS_URL = 127.0.0.1:8765/root.tar.gz#' "ish/$F"
+          grep -n '^ROOTFS_URL' "ish/$F"
           echo "--- resulting diff ---"
           git -C ish --no-pager diff --stat
 
@@ -173,7 +185,6 @@ jobs:
             ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=NO \
             ROOT_BUNDLE_IDENTIFIER="app.ish.iSH.opencode${BUNDLE_SUFFIX:-0}" \
-            ROOTFS_URL="127.0.0.1:8765/root.tar.gz" \
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_STYLE=Manual \
             CODE_SIGN_ENTITLEMENTS="" \
@@ -189,7 +200,11 @@ jobs:
         run: |
           set -euo pipefail
           bash integration/verify_app.sh "$RUNNER_TEMP/iSH.xcarchive/Products/Applications/$APP_NAME.app"
-          grep -c "GET /root.tar.gz" /tmp/rootfs-http.log || true
+          # Prove the app fetched OUR rootfs. If this is 0, xcodebuild used some
+          # other URL and the bundled rootfs may not contain opencode.
+          HITS="$(grep -c 'GET /root.tar.gz' /tmp/rootfs-http.log || true)"
+          echo "rootfs served from local http: $HITS request(s)"
+          [ "$HITS" -gt 0 ] || { echo "::error::Download Root never hit the local server"; cat /tmp/rootfs-http.log; exit 1; }
 
       - name: Package unsigned IPA
         run: |
