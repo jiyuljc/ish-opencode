@@ -108,10 +108,17 @@ jobs:
           mkdir -p build/opencode
           URL="https://github.com/anomalyco/opencode/releases/download/${OPENCODE_TAG}/opencode-linux-arm64-musl.tar.gz"
           echo "Downloading $URL"
-          curl -fsSL --retry 3 --retry-delay 2 -o build/opencode/opencode.tar.gz "$URL"
-          tar -xzf build/opencode/opencode.tar.gz -C build/opencode
-          BIN=$(find build/opencode -type f -name opencode | head -n1)
-          [ -n "$BIN" ] || { echo "::error::no opencode binary in archive"; exit 1; }
+          curl -fsSL --retry 3 --retry-delay 2 -o "$RUNNER_TEMP/opencode.tar.gz" "$URL"
+          # Unpack OUTSIDE build/opencode. The release tarball contains
+          # package/bin/opencode; unpacking into the same dir and then
+          # `install`ing to build/opencode/opencode made source == destination
+          # ("are the same file", exit 64). Keep the two paths distinct.
+          rm -rf "$RUNNER_TEMP/ocx" && mkdir -p "$RUNNER_TEMP/ocx" build/opencode
+          tar -xzf "$RUNNER_TEMP/opencode.tar.gz" -C "$RUNNER_TEMP/ocx"
+          BIN="$RUNNER_TEMP/ocx/package/bin/opencode"
+          [ -f "$BIN" ] || BIN=$(find "$RUNNER_TEMP/ocx" -type f -name opencode -print -quit)
+          [ -n "$BIN" ] && [ -f "$BIN" ] || { echo "::error::no opencode binary in archive"; exit 1; }
+          echo "source binary: $BIN"
           install -m 0755 "$BIN" build/opencode/opencode
           # glibc build would be silently unloadable on Alpine; fail early.
           python3 - <<'EOF'
