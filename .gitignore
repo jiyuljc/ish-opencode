@@ -1,0 +1,10 @@
+# Build output: rootfs artifacts, extracted copies, patch test scratch.
+build/
+
+# Fetched during testing; never commit multi-hundred-MB binaries.
+*.tar.gz
+opencode-real
+
+__pycache__/
+*.pyc
+.DS_Store

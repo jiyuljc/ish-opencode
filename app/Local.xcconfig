@@ -1,0 +1,28 @@
+// Local, personal settings for the iSH-ARM64 target. NOT ignored upstream
+// (upstream only ignores app/AOTImages.local.xcconfig), so keep this file out
+// of any PR: it is a personal build, not a project setting.
+//
+// Selected by setting BaseConfigurationReference to app/Local.xcconfig on the
+// iSH-ARM64 target (Project > Build Settings). Upstream's AppARM64.xcconfig is
+// untouched, so `git pull upstream master` stays conflict-free.
+
+// A bundle ID that is unique to this build. Two apps may not share an ID on a
+// device at the same time, so leaving this as app.ish.iSH.arm64 means this
+// build cannot be installed alongside TestFlight iSH.
+ROOT_BUNDLE_IDENTIFIER = app.ish.iSH.opencode
+
+// IMPORTANT: the "Download Root" phase always fetches from our injected rootfs
+// (see integration/README.md) - never from the pristine Alpine URL.
+
+// Point the "Download Root" build phase at the pre-loaded rootfs produced by
+// integration/inject_rootfs.py. ROOTFS_URL is consumed as https://$ROOTFS_URL,
+// so a file:// URL is not possible here - use a local server instead:
+//
+//   cd build/rootfs && python3 -m http.server 8765
+//
+// and set the value below to 127.0.0.1:8765/root.tar.gz
+ROOTFS_URL = 127.0.0.1:8765/root.tar.gz
+
+// Development team is not needed for an unsigned build; AltStore/SideStore
+// fills it in at signing time. Leave empty.
+DEVELOPMENT_TEAM =

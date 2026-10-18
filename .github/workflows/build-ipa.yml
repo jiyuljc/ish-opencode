@@ -1,0 +1,244 @@
+name: Build unsigned IPA (iSH-ARM64 + opencode)
+
+# Revised after reading jiyuljc/dsh-ios (same iSH-ARM64 base, real Actions
+# packaging). Four things in the first draft would have failed or shipped a
+# broken app; each is annotated where it appears:
+#   1. scheme is `iSH-ARM64` -> "iSH ARM64.app" (not `iSH`)
+#   2. `-destination generic/platform=iOS` + `archive`, not bare `-sdk iphoneos build`
+#   3. kernel/uname.c overflows a 65-byte field from the host nodename and
+#      SIGTRAPs the emulator at guest startup  -> integration/apply_patches.py
+#   4. app/hook.c sets thread debug state requiring task_for_pid-allow, which an
+#      AltStore signature does not carry -> iOS kills the app. Same script.
+
+on:
+  workflow_dispatch:
+    inputs:
+      opencode_version:
+        description: "opencode release tag to embed (e.g. v1.19.3)"
+        required: true
+        default: "v1.19.3"
+      ish_ref:
+        description: "OpenMinis/ish-arm64 ref to build"
+        required: true
+        default: "master"
+      release:
+        description: "Also publish the IPA as a GitHub Release (direct download, no login)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # needed for the optional Release
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  OPENCODE_TAG: ${{ inputs.opencode_version }}
+  ISH_REF: ${{ inputs.ish_ref }}
+  SCHEME: iSH-ARM64
+  APP_NAME: iSH ARM64
+  ARTIFACT: iSH-ARM64-opencode-unsigned
+
+jobs:
+  build:
+    runs-on: macos-15          # pinned so a runner-image bump cannot silently change output
+    timeout-minutes: 180       # cold build: submodules + 186 MB binary + archive
+    steps:
+      - name: Checkout integration scripts
+        uses: actions/checkout@v4
+
+      - name: Checkout iSH-ARM64
+        uses: actions/checkout@v4
+        with:
+          repository: OpenMinis/ish-arm64
+          ref: ${{ inputs.ish_ref }}
+          submodules: recursive   # deps/libarchive + deps/libapps are compiled in
+          path: ish
+
+      - name: Show resolved revisions
+        run: |
+          echo "iSH commit: $(git -C ish rev-parse HEAD)"
+          git -C ish submodule status --recursive
+
+      - name: Environment check
+        run: |
+          set -uo pipefail
+          sw_vers; uname -m
+          xcodebuild -version; xcrun --sdk iphoneos --show-sdk-version
+          df -h /
+          # This is the input that triggers the uname bug; print it so a failure
+          # can be attributed to the patch instead of guessed at.
+          H="$(hostname)"; echo "hostname=[$H] len=$(printf '%s' "$H" | wc -c | tr -d ' ')"
+
+      - name: Free disk space
+        continue-on-error: true
+        run: |
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/iOS*.simruntime || true
+          sudo rm -rf ~/Library/Developer/CoreSimulator/Caches/* || true
+          df -h /
+
+      - name: Install build dependencies
+        run: |
+          set -uo pipefail
+          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1
+          # llvm != lld: Homebrew's llvm is keg-only and no longer ships ld.lld,
+          # which meson needs for the guest vdso.
+          for pkg in meson ninja lld llvm libarchive pkg-config; do
+            brew list --formula "$pkg" >/dev/null 2>&1 || brew install "$pkg"
+          done
+          # Fakefsify only gets registered as a meson target when
+          # dependency('libarchive') resolves, so make pkg-config see it.
+          LA="$(brew --prefix libarchive)"
+          echo "PKG_CONFIG_PATH=$LA/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "LA_PREFIX=$LA" >> "$GITHUB_ENV"
+          pkg-config --exists libarchive && echo "libarchive ✓ ($(pkg-config --modversion libarchive))"
+          for p in lld llvm; do echo "$(brew --prefix "$p")/bin" >> "$GITHUB_PATH"; done
+          command -v ld.lld || { echo "::error::ld.lld missing"; exit 1; }
+
+      - name: Apply iSH-ARM64 fixes for re-signed builds
+        run: |
+          python3 integration/apply_patches.py --ish-src ish
+          echo "--- resulting diff ---"
+          git -C ish --no-pager diff --stat
+
+      - name: Fetch opencode arm64-musl binary
+        run: |
+          set -euo pipefail
+          mkdir -p build/opencode
+          URL="https://github.com/anomalyco/opencode/releases/download/${OPENCODE_TAG}/opencode-linux-arm64-musl.tar.gz"
+          echo "Downloading $URL"
+          curl -fsSL --retry 3 --retry-delay 2 -o build/opencode/opencode.tar.gz "$URL"
+          tar -xzf build/opencode/opencode.tar.gz -C build/opencode
+          BIN=$(find build/opencode -type f -name opencode | head -n1)
+          [ -n "$BIN" ] || { echo "::error::no opencode binary in archive"; exit 1; }
+          install -m 0755 "$BIN" build/opencode/opencode
+          # glibc build would be silently unloadable on Alpine; fail early.
+          python3 - <<'EOF'
+          import struct
+          b = open("build/opencode/opencode", "rb").read(64)
+          assert b[:4] == b"\x7fELF", "not an ELF"
+          assert struct.unpack_from("<H", b, 18)[0] == 0xB7, "not AArch64"
+          print("ELF ok: aarch64, type", struct.unpack_from("<H", b, 16)[0])
+          EOF
+          du -h build/opencode/opencode
+
+      - name: Download and rewrite rootfs
+        run: |
+          set -euo pipefail
+          # Same pin as app/GuestARM64.xcconfig; bump together if upstream does.
+          ROOTFS_URL="https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.0-aarch64.tar.gz"
+          curl -fsSL --retry 3 -o build/rootfs-orig.tar.gz "$ROOTFS_URL"
+          python3 integration/inject_rootfs.py \
+            --rootfs build/rootfs-orig.tar.gz \
+            --opencode build/opencode/opencode \
+            --out build/rootfs/root.tar.gz
+
+      - name: Serve rewritten rootfs to the Download Root phase
+        run: |
+          set -euo pipefail
+          # ROOTFS_URL is consumed as https://$ROOTFS_URL by the build phase, so a
+          # plain http server on loopback is the least-magic way to swap it.
+          cd build/rootfs
+          python3 -m http.server 8765 --bind 127.0.0.1 >/tmp/rootfs-http.log 2>&1 &
+          for _ in $(seq 1 30); do
+            curl -fsS --max-time 2 -o /dev/null http://127.0.0.1:8765/root.tar.gz && { echo up; exit 0; }
+            sleep 1
+          done
+          cat /tmp/rootfs-http.log; exit 1
+
+      - name: Archive app (unsigned)
+        env:
+          # Distinguishes this install from other builds on the same device;
+          # two apps may not share a bundle id.
+          BUNDLE_SUFFIX: ci
+        run: |
+          set -euo pipefail
+          cd ish
+          xcodebuild archive \
+            -project iSH.xcodeproj \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/iSH.xcarchive" \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            -sdk iphoneos \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            ROOT_BUNDLE_IDENTIFIER="app.ish.iSH.opencode${BUNDLE_SUFFIX:-0}" \
+            ROOTFS_URL="127.0.0.1:8765/root.tar.gz" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_ENTITLEMENTS="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            -skipPackagePluginValidation -skipMacroValidation \
+            | tee /tmp/xcodebuild.log
+          grep -E "error:|ARCHIVE (SUCCEEDED|FAILED)" /tmp/xcodebuild.log | tail -n 20 || true
+
+      - name: Verify archive contents
+        run: |
+          set -euo pipefail
+          bash integration/verify_app.sh "$RUNNER_TEMP/iSH.xcarchive/Products/Applications/$APP_NAME.app"
+          grep -c "GET /root.tar.gz" /tmp/rootfs-http.log || true
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/iSH.xcarchive/Products/Applications/$APP_NAME.app"
+          rm -rf "$RUNNER_TEMP/ipa"; mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$APP" "$RUNNER_TEMP/ipa/Payload/"
+          cd "$RUNNER_TEMP/ipa"
+          # ditto keeps bundle layout (framework/plugin symlinks) intact.
+          /usr/bin/ditto -c -k --sequesterRsrc --keepParent Payload "$RUNNER_TEMP/$ARTIFACT.ipa"
+          ls -lh "$RUNNER_TEMP/$ARTIFACT.ipa"
+          unzip -l "$RUNNER_TEMP/$ARTIFACT.ipa" | grep -q 'Payload/.*\.app/' || { echo "::error::bad IPA layout"; exit 1; }
+          {
+            echo "ish=$(git -C ish rev-parse HEAD)"
+            echo "opencode=$OPENCODE_TAG"
+            echo "patches=uname-bounded-hostname,hook-degrade-without-entitlement"
+            echo "xcode=$(xcodebuild -version | head -n1)"
+          } > "$RUNNER_TEMP/build-info.txt"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT }}
+          path: |
+            ${{ runner.temp }}/${{ env.ARTIFACT }}.ipa
+            ${{ runner.temp }}/build-info.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish Release (optional, direct download)
+        if: ${{ inputs.release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ipa-${{ inputs.opencode_version }}-${{ github.run_number }}
+          name: iSH-ARM64 + opencode ${{ inputs.opencode_version }} (unsigned)
+          body: |
+            Unsigned IPA: iSH-ARM64 with `opencode` ${{ inputs.opencode_version }} preinstalled.
+
+            Install with SideStore / AltStore (re-signs; free Apple ID = 7 day expiry).
+            `opencode` is already at `/usr/local/bin/opencode` in the bundled rootfs.
+
+            Two upstream iSH-ARM64 fixes are applied (see `integration/apply_patches.py`):
+            bounded hostname copy in `kernel/uname.c`, and non-fatal debug-state setup
+            in `app/hook.c` (the latter needs `task_for_pid-allow`, which a re-signed
+            build does not have).
+          files: ${{ runner.temp }}/${{ env.ARTIFACT }}.ipa
+          prerelease: true
+          fail_on_unmatched_files: true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: |
+            /tmp/xcodebuild.log
+            /tmp/rootfs-http.log
+          if-no-files-found: ignore
+          retention-days: 7
